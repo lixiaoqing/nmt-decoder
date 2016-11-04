@@ -35,32 +35,26 @@ __global__ void elementwise_op(int H, float *ax_t, float *ah_t, float *bias, flo
    h_t[idx] = u * h_tm1[idx] + (1-u) * hbar;
 }
 
-void show_matrix(float *d_m, int r, int c, string flag)
+__global__ void tanh(int H, float *v1, float *v2)
+{
+   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+   if (idx >= H ) 
+       return;
+   v1[idx] = tanhf(v1[idx]+v2[idx]);
+}
+
+void show_matrix(float *d_m, int r, int c)
 {
     vector<float> m;
     m.resize(r*c);
     cudaMemcpy(&m[0], d_m, r*c*sizeof(float), cudaMemcpyDeviceToHost);
-    if (flag == "row") //print rows
-    {
-        for (int i=0;i<r;i++)
-        {
-            for (int j=0;j<c;j++)
-            {
-                cout<<m[IDX2C(i,j,r)]<<' ';
-            }
-            cout<<endl;
-        }
-    }
-    else              //print cols
+    for (int i=0;i<r;i++)
     {
         for (int j=0;j<c;j++)
         {
-            for (int i=0;i<r;i++)
-            {
-                cout<<m[IDX2C(i,j,r)]<<' ';
-            }
-            cout<<endl;
+            cout<<m[IDX2C(i,j,r)]<<' ';
         }
+        cout<<endl;
     }
 }
 
@@ -74,7 +68,6 @@ int main()
     }
     string s;
     vector<string> param_names;
-    map<string,pair<int,int> > param2shape;
     vector<int> offset;
     offset.push_back(0);
     while(getline(flist,s))
@@ -84,11 +77,8 @@ int main()
         string pn;
         int x,y;
         ss>>pn>>x>>y;
-        //cout<<pn<<' '<<x<<' '<<y<<endl;
         param_names.push_back(pn);
-        param2shape[pn] = make_pair(x,y);
         offset.push_back(offset.back()+x*y);
-        //cout<<offset.back()<<endl;
     }
 
     ifstream fmodel("model.bin",ios::binary);
@@ -111,37 +101,6 @@ int main()
     {
         d_params[param_names[i]] = d_all_params + offset[i];
     }
-
-    /*
-    int E = 500;
-    int B = 2;
-    int V = 30000;
-
-    vector<int> word_indices;
-    word_indices.push_back(1);
-    word_indices.push_back(2);
-    int *d_word_indices;
-    cudaMalloc((void**)&d_word_indices, B*sizeof(int));
-    cudaMemcpy(d_word_indices, &word_indices[0], B*sizeof(int), cudaMemcpyHostToDevice);
-
-    int block_shape = 128;
-    dim3 grid_shape(B,(E + block_shape - 1)/block_shape,1);
-    float *d_lookup;
-    cudaMalloc((void**)&d_lookup, B*E*sizeof(float));
-
-    // B x E => [B x n] x E/n
-    lookup_kernel<<<grid_shape,block_shape>>>(d_lookup,d_params["Wemb"],d_word_indices,E,B,V);
-    vector<float> lookup;
-    lookup.resize(B*E);
-    cudaMemcpy(&lookup[0], d_lookup, B*E*sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i=0;i<B;i++)
-    {
-        for (int j=0;j<E;j++)
-        {
-            cout<<lookup[IDX2C(i,j,B)]<<endl;
-        }
-    }
-    */
 
     ifstream fsrc_w2i("1m.ch.w2i");
     if (!fsrc_w2i.is_open())
@@ -226,7 +185,7 @@ int main()
 
         // init h_0, hr_0 with all zeros
         cudaMemset(d_h_all,0,2*H*(T+2)*sizeof(float));
-        //show_matrix(d_h_all,2*H,T+2,"col");
+        //show_matrix(d_h_all,2*H,T+2);
 
         int *d_word_indices;
         cudaMalloc((void**)&d_word_indices, B*sizeof(int));
@@ -238,7 +197,7 @@ int main()
             // fill x_t; B x E => [B x n] x E/n
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
-            cudaMemcpy(d_word_indices, &word_indices[i], B*sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_word_indices, &word_indices[i], B*sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
             lookup_kernel<<<grid_shape,block_shape>>>(d_x_t,d_params["Wemb"],d_word_indices,E,B,V);
             // backward
             cudaMemcpy(d_word_indices_r, &word_indices[T-1-i], B*sizeof(int), cudaMemcpyHostToDevice);
@@ -262,7 +221,28 @@ int main()
             //backward
             elementwise_op<<<grid_shape1,block_shape1>>>(H,d_axr_t,d_ahr_t,d_params["encoder_r_b"],d_hr_Tp1mt,d_h_all+(2*T+1-2*i)*H);
         }
-        show_matrix(d_h_all,2*H,T+1,"col");
+        //show_matrix(d_h_all+2*H,2*H,T);
+
+        float *d_ctx_mean, *d_init_state;
+        cudaMalloc((void**)&d_ctx_mean, 2*H*sizeof(float));
+        cudaMalloc((void**)&d_init_state, H*sizeof(float));
+        vector<float> part(T,1.0/T);
+        float *d_part;  // TODO could be done outside
+        cudaMalloc((void**)&d_part, T*sizeof(float));
+        cudaMemcpy(d_part, &part[0], T*sizeof(float), cudaMemcpyHostToDevice);
+        //cublasSgemv(handle,CUBLAS_OP_N,2*H,T,&alpha,d_h_all,2*H,d_part,1,&beta,d_ctx_mean,1);
+        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all+2*H,2*H,d_part,T,&beta,d_ctx_mean,2*H);
+        //show_matrix(d_ctx_mean,1,2*H);
+        //show_matrix(d_params["ff_state_W"],2*H,H);
+
+        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,H,2*H,&alpha,d_ctx_mean,1,d_params["ff_state_W"],2*H,&beta,d_init_state,1);
+
+        dim3 block_shape(256,1,1);
+        dim3 grid_shape((H + block_shape.x - 1)/block_shape.x,1,1);
+        tanh<<<grid_shape,block_shape>>>(H,d_init_state,d_params["ff_state_b"]);
+
+        //show_matrix(d_init_state,1,H);
+
         break;
     }
 }
