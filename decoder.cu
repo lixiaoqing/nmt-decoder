@@ -2,6 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <map>
+#include <queue>
 #include <string>
 #include <sstream>
 #include <cublas_v2.h>
@@ -95,8 +96,7 @@ __global__ void divide_log(float *m, float *v, int B, int V)
     int j = threadIdx.x + blockIdx.y*blockDim.x;
     if (j >= V ) 
         return;
-    //m[IDX2C(i,j,B)] = logf(m[IDX2C(i,j,B)]/v[i]);
-    m[IDX2C(i,j,B)] = m[IDX2C(i,j,B)]/v[i];
+    m[IDX2C(i,j,B)] = logf(m[IDX2C(i,j,B)]/v[i]);
 }
 
 __forceinline__ __device__ float sigmoidf(float in) {
@@ -338,17 +338,15 @@ int main()
         //cout<<"==============\n";
 
         /************** decoder part ******************/
-        vector<vector<int> > sample;
-        vector<float> sample_score;
+        vector<vector<int> > final_samples;
+        vector<float> final_scores;
         
-        int live_k = 1;
         int dead_k = 0;
         int K = 10;       // Beamsize
-        B = live_k;
+        B = 1;
 
-        vector<vector<int> > hyp_samples;
-        vector<float> hyp_scores;
-        vector<vector<float> > hyp_states;
+        vector<vector<int> > hyp_samples(1,vector<int>());
+        vector<float> hyp_scores(1,0.0);
 
         float *d_h_all_trans;
         cudaMalloc((void**)&d_h_all_trans, T*2*H*sizeof(float));
@@ -401,6 +399,10 @@ int main()
         cudaMalloc((void**)&d_logit, K*E*sizeof(float));
         cudaMalloc((void**)&d_logit_softmax, K*V*sizeof(float));
         cudaMalloc((void**)&d_logit_softmax_sum, K*sizeof(float));
+
+        vector<float> logit_softmax,s_t;
+        logit_softmax.resize(K*V);
+        s_t.resize(K*H);
 
         for (int j=0; j < 200; j++)
         {
@@ -504,11 +506,104 @@ int main()
             dim3 block_shape7(256,1,1);
             dim3 grid_shape7(B,(V + block_shape7.x - 1)/block_shape7.x,1);
             divide_log<<<grid_shape7,block_shape7>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
-            show_matrix(d_logit_softmax,B,V);
-            cout<<"==============\n";
+            //show_matrix(d_logit_softmax,B,V);
+            //cout<<"==============\n";
 
-            break;
+            int live_k = K - dead_k;
+            cudaMemcpy(&logit_softmax[0], d_logit_softmax, B*V*sizeof(float), cudaMemcpyDeviceToHost);
+            priority_queue<pair<float,pair<int,int> >,vector<pair<float,pair<int,int> > >,greater<pair<float,pair<int,int> > > > q;
+            for (int i=0;i<B;i++)
+            {
+                for (int j=0;j<V;j++)
+                {
+                    float score = logit_softmax[IDX2C(i,j,B)] + hyp_scores[i];
+                    if (q.size() < live_k )
+                        q.push(make_pair(score, make_pair(i,j)));
+                    else
+                    {
+                        if (q.top().first < score)
+                        {
+                            q.pop();
+                            q.push(make_pair(score, make_pair(i,j)));
+                        }
+                    }
+                }
+            }
+
+            vector<vector<int> > new_hyp_samples;
+            vector<float> new_hyp_scores;
+            cudaMemcpy(&s_t[0], d_s_t, B*H*sizeof(float), cudaMemcpyDeviceToHost);
+            vector<int> ivec;
+            for (int k = 0; k < live_k; k++) 
+            {
+                //std::cout << q.top().first<<' '<<q.top().second<<endl;
+                float score = q.top().first;
+                int i = q.top().second.first;
+                int j = q.top().second.second;
+                ivec.push_back(i);
+                if (j == 0)
+                    dead_k += 1;
+                vector<int> sample(hyp_samples[i]);
+                sample.push_back(j);
+                new_hyp_samples.push_back(sample);
+                new_hyp_scores.push_back(score);
+                q.pop();
+            }
+
+            int old_B = B;
+            B = K-dead_k;
+            hyp_samples.clear();
+            hyp_scores.clear();
+            tgt_word_indices.clear();
+            int kk = 0;
+            vector<float> new_hyp_states;
+            new_hyp_states.resize(B*H);
+            for (int k = 0; k < new_hyp_samples.size(); k++) 
+            {
+                if (new_hyp_samples[k].back() == 0)
+                {
+                    final_samples.push_back(new_hyp_samples[k]);
+                    final_scores.push_back(new_hyp_scores[k]);
+                }
+                else
+                {
+                    hyp_samples.push_back(new_hyp_samples[k]);
+                    hyp_scores.push_back(new_hyp_scores[k]);
+                    tgt_word_indices.push_back(new_hyp_samples[k].back());
+                    for (int h=0;h<H;h++)
+                       new_hyp_states[IDX2C(kk,h,B)] = s_t[IDX2C(ivec[k],h,old_B)];
+                    kk += 1;
+                }
+            }
+            if (B<=0)
+                break;
+            cudaMemcpy(d_s_tm1, &new_hyp_states[0], B*H*sizeof(float), cudaMemcpyHostToDevice);
         }
+        if (K - dead_k > 0)
+        {
+            for (int k=0;k<K-dead_k;k++)
+            {
+                final_samples.push_back(hyp_samples[k]);
+                final_scores.push_back(hyp_scores[k]);
+            }
+        }
+        float best_score = -9999;
+        int best_k = 0;
+        for (int k=0;k<final_samples.size();k++)
+        {
+            float score = final_scores[k]/final_samples[k].size();
+            if (score > best_score)
+            {
+                best_score = score;
+                best_k = k;
+            }
+        }
+        for (int i=0;i<final_samples[best_k].size();i++)
+        {
+            cout<<tgt_i2w[final_samples[best_k][i]]<<' ';
+        }
+        cout<<endl;
+
         break;
     }
 }
