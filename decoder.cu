@@ -13,13 +13,12 @@ __global__ void lookup_kernel(float *d_lookup, const float *d_Wemb, int *d_word_
 {
     int i = blockIdx.x;
     int j = threadIdx.x + blockIdx.y*blockDim.x;
-    if (j < E)
-    {
-        if (d_word_indices[i] < 0)
-            d_lookup[IDX2C(i,j,B)] = 0;
-        else
-            d_lookup[IDX2C(i,j,B)] = d_Wemb[IDX2C(d_word_indices[i],j,V)];
-    }
+    if (j >= E)
+        return;
+    if (d_word_indices[i] < 0)
+        d_lookup[IDX2C(i,j,B)] = 0;
+    else
+        d_lookup[IDX2C(i,j,B)] = d_Wemb[IDX2C(d_word_indices[i],j,V)];
 }
 
 __global__ void tanh(float *v1, float *v2, int len)
@@ -31,46 +30,54 @@ __global__ void tanh(float *v1, float *v2, int len)
 }
 
 // grid shape (3-dim): T x B x 2H/n, block shape (1-dim): n
-__global__ void tanh(float *t3, float *m1, float *m2, int HH)
+__global__ void tanh(float *t3, float *m1, float *m2, float *bias, int T, int B, int HH)
 {
     int i = blockIdx.x;
     int j = blockIdx.y;
     int k = threadIdx.x + blockIdx.z*blockDim.x;
-    t3[IDX2C(i+j*gridDim.x,k,HH)] = tanhf(m1[IDX2C(i,k,HH)]+m2[IDX2C(j,k,HH)]);
+    if (k >= HH)
+        return;
+    t3[IDX2C(i+j*gridDim.x,k,T*B)] = tanhf(m1[IDX2C(i,k,T)]+m2[IDX2C(j,k,B)]+bias[k]);
 }
 
 // grid shape (2-dim): B x E/n, block shape (1-dim): n
-__global__ void tanh(float *m, float *m1, float *m2, float *m3, float *b1, float *b2, float *b3, int B)
+__global__ void tanh(float *m, float *m1, float *m2, float *m3, float *b1, float *b2, float *b3, int B, int E)
 {
     int i = blockIdx.x;
     int j = threadIdx.x + blockIdx.y*blockDim.x;
+    if (j >= E)
+        return;
     m[IDX2C(i,j,B)] = tanhf(m1[IDX2C(i,j,B)]+m2[IDX2C(i,j,B)]+m3[IDX2C(i,j,B)]+b1[j]+b2[j]+b3[j]);
 }
 
-__global__ void exp(float *v1, int len)
+__global__ void exp_c(float *v1, float *b, int len)
 {
    int idx = blockIdx.x * blockDim.x + threadIdx.x;
    if (idx >= len ) 
        return;
-   v1[idx] = expf(v1[idx]);
+   v1[idx] = expf(v1[idx]+b[0]);
 }
 
 // grid shape (2-dim): B x V/n, block shape (1-dim): n
-__global__ void exp(float *m, float *b, int B)
+__global__ void exp_v(float *m, float *b, int B, int V)
 {
     int i = blockIdx.x;
     int j = threadIdx.x + blockIdx.y*blockDim.x;
+    if (j >= V ) 
+        return;
     m[IDX2C(i,j,B)] = expf(m[IDX2C(i,j,B)]+b[j]);
 }
 
 // ctx_ = (ctx[:,None,:] * alpha[:,:,None]).sum(0)
 // grid shape (3-dim): T x B x 2H/n, block shape (1-dim): n
-__global__ void pointwise_prod(float *t3, float *m1, float *m2, int HH)
+__global__ void pointwise_prod(float *t3, float *m1, float *m2, int T, int B, int HH)
 {
     int i = blockIdx.x;
     int j = blockIdx.y;
     int k = threadIdx.x + blockIdx.z*blockDim.x;
-    t3[IDX2C(i+j*gridDim.x,k,HH)] = m1[IDX2C(i,k,HH)] * m2[IDX2C(i+j*gridDim.x,1,1)];
+    if (k >= HH)
+        return;
+    t3[IDX2C(i+j*gridDim.x,k,T*B)] = m1[IDX2C(i,k,T)] * m2[IDX2C(i,j,T)];
 }
 
 __global__ void divide(float *v1, float *v2, int len)
@@ -81,19 +88,22 @@ __global__ void divide(float *v1, float *v2, int len)
    v1[idx] = v1[idx]/v2[threadIdx.x];
 }
 
-__global__ void divide_log(float *v1, float *v2, int len)
+// grid shape (2-dim): B x V/n, block shape (1-dim): n
+__global__ void divide_log(float *m, float *v, int B, int V)
 {
-   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-   if (idx >= len ) 
-       return;
-   v1[idx] = logf(v1[idx]/v2[threadIdx.x]);
+    int i = blockIdx.x;
+    int j = threadIdx.x + blockIdx.y*blockDim.x;
+    if (j >= V ) 
+        return;
+    //m[IDX2C(i,j,B)] = logf(m[IDX2C(i,j,B)]/v[i]);
+    m[IDX2C(i,j,B)] = m[IDX2C(i,j,B)]/v[i];
 }
 
 __forceinline__ __device__ float sigmoidf(float in) {
    return 1.f / (1.f + expf(-in));  
 }
 
-__global__ void elementwise_op(int H, float *ax_t, float *ah_t, float *bias, float *h_tm1, float *h_t)
+__global__ void elementwise_op(float *h_t,float *ax_t, float *ah_t, float *bias, float *h_tm1, int H)
 {
    int idx = blockIdx.x * blockDim.x + threadIdx.x;
    if (idx >= H ) 
@@ -105,16 +115,19 @@ __global__ void elementwise_op(int H, float *ax_t, float *ah_t, float *bias, flo
    h_t[idx] = u * h_tm1[idx] + (1-u) * hbar;
 }
 
-__global__ void elementwise_op_dec(int H, float *ay_t, float *as_t, float *ac_t, float *bias, float *s_tm1, float *s_t)
+// grid shape: B x H/n, block shape: n
+__global__ void elementwise_op_dec(float *s_t, float *ay_t, float *as_t, float *ac_t, float *bias, float *s_tm1, int B, int H)
 {
-   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-   if (idx >= H ) 
-       return;
-   float r, u, sbar;
-   r = sigmoidf(ay_t[idx] + as_t[idx] + ac_t[idx] + bias[idx]);
-   u = sigmoidf(ay_t[H+idx] + as_t[H+idx] + ac_t[H+idx] + bias[H+idx]);
-   sbar = tanhf(ay_t[2*H+idx] + as_t[2*H+idx]*r + ac_t[2*H+idx] + bias[2*H+idx]);
-   s_t[idx] = u * s_tm1[idx] + (1-u) * sbar;
+    int i = blockIdx.x;
+    int j = threadIdx.x + blockIdx.y*blockDim.x;
+    if (j >= H)
+        return;
+
+    float r, u, sbar;
+    r = sigmoidf(ay_t[IDX2C(i,j,B)] + as_t[IDX2C(i,j,B)] + ac_t[IDX2C(i,j,B)] + bias[j]);
+    u = sigmoidf(ay_t[IDX2C(i,j+H,B)] + as_t[IDX2C(i,j+H,B)] + ac_t[IDX2C(i,j+H,B)] + bias[j+H]);
+    sbar = tanhf(ay_t[IDX2C(i,j+2*H,B)] + as_t[IDX2C(i,j+2*H,B)]*r + ac_t[IDX2C(i,j+2*H,B)] + bias[j+2*H]);
+    s_t[IDX2C(i,j,B)] = u * s_tm1[IDX2C(i,j,B)] + (1-u) * sbar;
 }
 
 void show_matrix(float *d_m, int r, int c)
@@ -298,9 +311,9 @@ int main()
             // point wise operation
             dim3 block_shape1(256,1,1);
             dim3 grid_shape1((H + block_shape1.x - 1)/block_shape1.x,1,1);
-            elementwise_op<<<grid_shape1,block_shape1>>>(H,d_ax_t,d_ah_t,d_params["encoder_b"],d_h_tm1,d_h_all+2*(i+1)*H);
+            elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+2*(i+1)*H,d_ax_t,d_ah_t,d_params["encoder_b"],d_h_tm1,H);
             //backward
-            elementwise_op<<<grid_shape1,block_shape1>>>(H,d_axr_t,d_ahr_t,d_params["encoder_r_b"],d_hr_Tp1mt,d_h_all+(2*T+1-2*i)*H);
+            elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+(2*T+1-2*i)*H,d_axr_t,d_ahr_t,d_params["encoder_r_b"],d_hr_Tp1mt,H);
         }
         d_h_all = d_h_all + 2*H;         // skip h0
         //show_matrix(d_h_all,2*H,T);
@@ -322,8 +335,9 @@ int main()
         tanh<<<grid_shape,block_shape>>>(d_init_state,d_params["ff_state_b"],H);
 
         //show_matrix(d_init_state,1,H);
+        //cout<<"==============\n";
 
-        // decoder part
+        /************** decoder part ******************/
         vector<vector<int> > sample;
         vector<float> sample_score;
         
@@ -336,13 +350,18 @@ int main()
         vector<float> hyp_scores;
         vector<vector<float> > hyp_states;
 
+        float *d_h_all_trans;
+        cudaMalloc((void**)&d_h_all_trans, T*2*H*sizeof(float));
         // transpose ctx (2H x T) to T x 2H
-        cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all, 2*H, &beta, d_h_all, T, d_h_all, T );
+        cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all, 2*H, &beta, d_h_all, 2*H, d_h_all_trans, T );
         // prod ctx with decoder_Wc_att to get pctx_ (T x 2H)
         float *d_pctx_;
         cudaMalloc((void**)&d_pctx_, T*2*H*sizeof(float));
-        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
+        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all_trans,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
+        //show_matrix(d_pctx_,T,2*H);
+        //cout<<"==============\n";
 
+        // allocate memory for target input words at each time step
         vector<int> tgt_word_indices;
         tgt_word_indices.push_back(-1);
         int *d_tgt_word_indices;
@@ -358,23 +377,23 @@ int main()
 
         cudaMalloc((void**)&d_y_tm1, K*E*sizeof(float));
         cudaMalloc((void**)&d_pstate_, K*2*H*sizeof(float));
-        cudaMalloc((void**)&d_pstate_, T*K*2*H*sizeof(float));
+        cudaMalloc((void**)&d_pctx__, T*K*2*H*sizeof(float));
         cudaMalloc((void**)&d_att, T*K*sizeof(float));
         cudaMalloc((void**)&d_att_sum, K*sizeof(float));
-        cudaMalloc((void**)&d_ctx, T*B*2*H*sizeof(float));
-        cudaMalloc((void**)&d_ctx_sum, B*2*H*sizeof(float));
+        cudaMalloc((void**)&d_ctx, T*K*2*H*sizeof(float));
+        cudaMalloc((void**)&d_ctx_sum, K*2*H*sizeof(float));
 
         // allocate memory for affine_y = y_{t-1} x [U_z,U_r,U_h]
-        // affine_h = s_{t-1} x [W_z,W_r,W_h] on device
+        // affine_s = s_{t-1} x [W_z,W_r,W_h] on device
         // affine_c = ctx_ x [Wc_z,Wc_r,Wc_h] on device
         float *d_ay_t, *d_as_t, *d_ac_t;
         float *d_s_t;
         float *d_logit_lstm, *d_logit_prev, *d_logit_ctx;
         float *d_logit, *d_logit_softmax, *d_logit_softmax_sum;
 
-        cudaMalloc((void**)&d_ay_t, 3*H*sizeof(float));
-        cudaMalloc((void**)&d_as_t, 3*H*sizeof(float));
-        cudaMalloc((void**)&d_ac_t, 3*H*sizeof(float));
+        cudaMalloc((void**)&d_ay_t, K*3*H*sizeof(float));
+        cudaMalloc((void**)&d_as_t, K*3*H*sizeof(float));
+        cudaMalloc((void**)&d_ac_t, K*3*H*sizeof(float));
         cudaMalloc((void**)&d_s_t, K*H*sizeof(float));
         cudaMalloc((void**)&d_logit_lstm, K*E*sizeof(float));
         cudaMalloc((void**)&d_logit_prev, K*E*sizeof(float));
@@ -394,22 +413,38 @@ int main()
             // product prev_state with decoder_Wd_att to get pstate_ (B x 2H)
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,H,&alpha,d_s_tm1,B,d_params["decoder_Wd_att"],H,&beta,d_pstate_,B);
 
+            //show_matrix(d_pstate_,B,2*H);
+            //cout<<"==============\n";
+
             // product prev_emb with decoder_Wi_att and add the result to pstate_
             float beta1 = 1;
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,E,&alpha,d_y_tm1,B,d_params["decoder_Wi_att"],E,&beta1,d_pstate_,B);
 
-            // pctx__ = tanh(pctx_[:,None,:] + pstate_[None,:,:])
+            //show_matrix(d_pstate_,B,2*H);
+            //cout<<"==============\n";
+
+            // pctx__ = tanh(pctx_[:,None,:] + pstate_[None,:,:] + b_att[None,None,:])
             dim3 block_shape1(128,1,1);
-            dim3 grid_shape1(T,B,(E + block_shape1.x - 1)/block_shape1.x);
-            tanh<<<grid_shape1,block_shape1>>>(d_pctx__,d_pctx_,d_pstate_,2*H);
+            dim3 grid_shape1(T,B,(2*H + block_shape1.x - 1)/block_shape1.x);
+            tanh<<<grid_shape1,block_shape1>>>(d_pctx__,d_pctx_,d_pstate_,d_params["decoder_b_att"],T,B,2*H);
+
+            /*
+            show_matrix(d_pctx__,T*B,2*H);
+            cout<<"==============\n";
+            show_matrix(d_params["decoder_U_att"],1,2*H);
+            cout<<"==============\n";
+            */
 
             // product pctx__ with decoder_U_att (2H x 1) to get alpha (T x B)
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T*B,1,2*H,&alpha,d_pctx__,T*B,d_params["decoder_U_att"],2*H,&beta,d_att,T*B);
+            
+            //show_matrix(d_att,T,B);
+            //cout<<"==============\n";
 
             // normalize alpha: alpha = exp(alpha)/exp(alpha).sum(0)
             dim3 block_shape2(256,1,1);
             dim3 grid_shape2((T*B + block_shape2.x - 1)/block_shape2.x,1,1);
-            exp<<<grid_shape2,block_shape2>>>(d_att,T*B);
+            exp_c<<<grid_shape2,block_shape2>>>(d_att,d_params["decoder_c_tt"],T*B);
 
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,B,T,&alpha,d_ones,1,d_att,T,&beta,d_att_sum,1);
 
@@ -417,40 +452,62 @@ int main()
             dim3 grid_shape3(T,1,1);
             divide<<<grid_shape3,block_shape3>>>(d_att,d_att_sum,T*B);
 
+            //show_matrix(d_att,T,B);
+            //cout<<"==============\n";
+
             // ctx_ = (ctx[:,None,:] * alpha[:,:,None]).sum(0)
             dim3 block_shape4(128,1,1);
             dim3 grid_shape4(T,B,(2*H + block_shape4.x - 1)/block_shape4.x);
-            pointwise_prod<<<grid_shape4,block_shape4>>>(d_ctx,d_h_all,d_att,2*H);
+            pointwise_prod<<<grid_shape4,block_shape4>>>(d_ctx,d_h_all_trans,d_att,T,B,2*H);
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,B*2*H,T,&alpha,d_ones,1,d_ctx,T,&beta,d_ctx_sum,1);
+
+            //show_matrix(d_ctx_sum,B,2*H);
+            //cout<<"==============\n";
 
             // get ay_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,E,&alpha,d_y_tm1,B,d_params["decoder_W"],E,&beta,d_ay_t,B);
+            //show_matrix(d_ay_t,B,3*H);
+            //cout<<"==============\n";
             // get as_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,H,&alpha,d_s_tm1,B,d_params["decoder_U"],H,&beta,d_as_t,B);
+            //show_matrix(d_as_t,B,3*H);
+            //cout<<"==============\n";
             // get ac_t
-            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,2*H,&alpha,d_ctx,B,d_params["decoder_Wc"],2*H,&beta,d_ac_t,B);
+            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,2*H,&alpha,d_ctx_sum,B,d_params["decoder_Wc"],2*H,&beta,d_ac_t,B);
+            //show_matrix(d_ac_t,B,3*H);
+            //cout<<"==============\n";
             // point wise operation
             dim3 block_shape5(256,1,1);
-            dim3 grid_shape5((H + block_shape5.x - 1)/block_shape5.x,1,1);
-            elementwise_op_dec<<<grid_shape5,block_shape5>>>(H,d_ay_t,d_as_t,d_ac_t,d_params["decoder_b"],d_s_tm1,d_s_t);
+            dim3 grid_shape5(B,(H + block_shape5.x - 1)/block_shape5.x,1);
+            elementwise_op_dec<<<grid_shape5,block_shape5>>>(d_s_t,d_ay_t,d_as_t,d_ac_t,d_params["decoder_b"],d_s_tm1,B,H);
+
+            //show_matrix(d_s_t,B,H);
+            //cout<<"==============\n";
 
             // logit = tanh(W x s_t + bs + U x y_tm1 + by + V x ctx + bv)
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,E,H,&alpha,d_s_t,B,d_params["ff_logit_lstm_W"],H,&beta,d_logit_lstm,B);
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,E,E,&alpha,d_y_tm1,B,d_params["ff_logit_prev_W"],E,&beta,d_logit_prev,B);
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,E,2*H,&alpha,d_ctx_sum,B,d_params["ff_logit_ctx_W"],2*H,&beta,d_logit_ctx,B);
             tanh<<<grid_shape,block_shape>>>(d_logit,d_logit_lstm,d_logit_prev,d_logit_ctx,
-                    d_params["ff_logit_lstm_b"],d_params["ff_logit_prev_b"],d_params["ff_logit_ctx_b"],B);
+                    d_params["ff_logit_lstm_b"],d_params["ff_logit_prev_b"],d_params["ff_logit_ctx_b"],B,E);
+            //show_matrix(d_logit,B,E);
+            //cout<<"==============\n";
+
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,V,E,&alpha,d_logit,B,d_params["ff_logit_W"],E,&beta,d_logit_softmax,B);
 
             dim3 block_shape6(256,1,1);
             dim3 grid_shape6(B,(V + block_shape6.x - 1)/block_shape6.x,1);
-            exp<<<grid_shape6,block_shape6>>>(d_logit_softmax, d_params["ff_logit_b"], B);
+            exp_v<<<grid_shape6,block_shape6>>>(d_logit_softmax, d_params["ff_logit_b"], B, V);
             // sum
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,1,V,&alpha,d_logit_softmax,B,d_ones,V,&beta,d_logit_softmax_sum,B);
             // divide
             dim3 block_shape7(256,1,1);
             dim3 grid_shape7(B,(V + block_shape7.x - 1)/block_shape7.x,1);
-            divide_log<<<grid_shape7,block_shape7>>>(d_logit_softmax,d_logit_softmax_sum,B*V);
+            divide_log<<<grid_shape7,block_shape7>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
+            show_matrix(d_logit_softmax,B,V);
+            cout<<"==============\n";
+
+            break;
         }
         break;
     }
