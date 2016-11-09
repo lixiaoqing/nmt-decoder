@@ -81,12 +81,11 @@ __global__ void pointwise_prod(float *t3, float *m1, float *m2, int T, int B, in
     t3[IDX2C(i+j*gridDim.x,k,T*B)] = m1[IDX2C(i,k,T)] * m2[IDX2C(i,j,T)];
 }
 
-__global__ void divide(float *v1, float *v2, int len)
+__global__ void divide(float *v1, float *v2, int T)
 {
-   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-   if (idx >= len ) 
-       return;
-   v1[idx] = v1[idx]/v2[threadIdx.x];
+   int i = blockIdx.x;
+   int j = threadIdx.x;
+   v1[IDX2C(i,j,T)] = v1[IDX2C(i,j,T)]/v2[j];
 }
 
 // grid shape (2-dim): B x V/n, block shape (1-dim): n
@@ -233,7 +232,7 @@ int main()
     int H = 1024;
     int B = 1;
     int V = 30000;
-    int K = 10;
+    int K = 4;
     int Tmax = 200;
 
     vector<float> ones(V,1);
@@ -258,9 +257,9 @@ int main()
     cudaMalloc((void**)&d_h_all, 2*H*(Tmax+2)*sizeof(float));
 
     int *d_word_indices;
-    cudaMalloc((void**)&d_word_indices, B*sizeof(int));
+    cudaMalloc((void**)&d_word_indices, sizeof(int));
     int *d_word_indices_r;
-    cudaMalloc((void**)&d_word_indices_r, B*sizeof(int));
+    cudaMalloc((void**)&d_word_indices_r, sizeof(int));
 
     float *d_ctx_mean, *d_init_state;
     cudaMalloc((void**)&d_ctx_mean, 2*H*sizeof(float));
@@ -338,10 +337,10 @@ int main()
             // fill x_t; B x E => [B x E/n] x n
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
-            cudaMemcpy(d_word_indices, &word_indices[i], B*sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
+            cudaMemcpy(d_word_indices, &word_indices[i], sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
             lookup_kernel<<<grid_shape,block_shape>>>(d_x_t,d_params["Wemb"],d_word_indices,E,B,V);
             // backward
-            cudaMemcpy(d_word_indices_r, &word_indices[T-1-i], B*sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_word_indices_r, &word_indices[T-1-i], sizeof(int), cudaMemcpyHostToDevice);
             lookup_kernel<<<grid_shape,block_shape>>>(d_xr_t,d_params["Wemb"],d_word_indices_r,E,B,V);
             // get ax_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,E,&alpha,d_x_t,B,d_params["encoder_W"],E,&beta,d_ax_t,B);
@@ -378,8 +377,8 @@ int main()
         dim3 grid_shape((H + block_shape.x - 1)/block_shape.x,1,1);
         tanh<<<grid_shape,block_shape>>>(d_init_state,d_params["ff_state_b"],H);
 
-        //show_matrix(d_init_state,1,H);
-        //cout<<"==============\n";
+        show_matrix(d_init_state,1,H);
+        cout<<"==============\n";
 
         /************** decoder part ******************/
         vector<vector<int> > final_samples;
@@ -403,12 +402,11 @@ int main()
         // prev state on target side
         cudaMemcpy(d_s_tm1, d_init_state, H*sizeof(float), cudaMemcpyDeviceToDevice);
 
-
         vector<float> logit_softmax,s_t;
         logit_softmax.resize(K*V);
         s_t.resize(K*H);
 
-        for (int j=0; j < 200; j++)
+        for (int j=0; j < Tmax; j++)
         {
             // fill y_{t-1}; B x E => [B x E/n] x n
             dim3 block_shape(128,1,1);
@@ -416,7 +414,7 @@ int main()
             cudaMemcpy(d_tgt_word_indices, &tgt_word_indices[0], B*sizeof(int), cudaMemcpyHostToDevice);
             lookup_kernel<<<grid_shape,block_shape>>>(d_y_tm1,d_params["Wemb_dec"],d_tgt_word_indices,E,B,V);
 
-            // product prev_state with decoder_Wd_att to get pstate_ (B x 2H)
+            // product prev_state with decoder_Wd_att to get pstate_
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,H,&alpha,d_s_tm1,B,d_params["decoder_Wd_att"],H,&beta,d_pstate_,B);
 
             //show_matrix(d_pstate_,B,2*H);
@@ -456,7 +454,7 @@ int main()
 
             dim3 block_shape3(B,1,1);
             dim3 grid_shape3(T,1,1);
-            divide<<<grid_shape3,block_shape3>>>(d_att,d_att_sum,T*B);
+            divide<<<grid_shape3,block_shape3>>>(d_att,d_att_sum,T);
 
             //show_matrix(d_att,T,B);
             //cout<<"==============\n";
@@ -536,14 +534,13 @@ int main()
 
             vector<vector<int> > new_hyp_samples;
             vector<float> new_hyp_scores;
-            cudaMemcpy(&s_t[0], d_s_t, B*H*sizeof(float), cudaMemcpyDeviceToHost);
             vector<int> ivec;
             for (int k = 0; k < live_k; k++) 
             {
-                //std::cout << q.top().first<<' '<<q.top().second<<endl;
                 float score = q.top().first;
                 int i = q.top().second.first;
                 int j = q.top().second.second;
+                //cout<<score<<' '<<i<<' '<<j<<endl;
                 ivec.push_back(i);
                 if (j == 0)
                     dead_k += 1;
@@ -553,8 +550,10 @@ int main()
                 new_hyp_scores.push_back(score);
                 q.pop();
             }
+            //cout<<"==============="<<endl;
 
             int old_B = B;
+            cudaMemcpy(&s_t[0], d_s_t, old_B*H*sizeof(float), cudaMemcpyDeviceToHost);
             B = K-dead_k;
             hyp_samples.clear();
             hyp_scores.clear();
@@ -579,6 +578,19 @@ int main()
                     kk += 1;
                 }
             }
+            /*
+            cout<<tgt_word_indices.size()<<endl;
+            for (int i=0;i<tgt_word_indices.size();i++)
+                cout<<tgt_word_indices[i]<<' ';
+            cout<<endl;
+            for (int i=0;i<B;i++)
+            {
+                for (int j=0;j<H;j++)
+                    cout<<new_hyp_states[IDX2C(i,j,B)]<<' ';
+                cout<<endl;
+            }
+            cout<<"==============";
+            */
             if (B<=0)
                 break;
             cudaMemcpy(d_s_tm1, &new_hyp_states[0], B*H*sizeof(float), cudaMemcpyHostToDevice);
@@ -602,12 +614,10 @@ int main()
                 best_k = k;
             }
         }
-        for (int i=0;i<final_samples[best_k].size();i++)
+        for (int i=0;i<final_samples[best_k].size() - 1;i++)
         {
             cout<<tgt_i2w[final_samples[best_k][i]]<<' ';
         }
         cout<<endl;
-
-        break;
     }
 }
