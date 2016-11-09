@@ -233,11 +233,84 @@ int main()
     int H = 1024;
     int B = 1;
     int V = 30000;
+    int K = 10;
+    int Tmax = 200;
 
     vector<float> ones(V,1);
     float *d_ones;
     cudaMalloc((void**)&d_ones, V*sizeof(float));
     cudaMemcpy(d_ones, &ones[0], V*sizeof(float), cudaMemcpyHostToDevice);
+
+    // allocate memory for x_t, h_{0:T}, affine_x = x_t x [U_z,U_r,U_h], affine_h = h_{t-1} x [W_z,W_r,W_h] on device
+    // forward: d_x_t, d_ax_t, d_ah_t; backward: d_xr_t, d_axr_t, d_ahr_t; both: d_h_all = [h_0,hr_{T+1},h1,hr_T,...,h_{T+1},hr_0]
+    float *d_x_t, *d_ax_t, *d_ah_t;
+    float *d_xr_t, *d_axr_t, *d_ahr_t;
+    float *d_h_all;
+
+    cudaMalloc((void**)&d_x_t, E*sizeof(float));
+    cudaMalloc((void**)&d_ax_t, 3*H*sizeof(float));
+    cudaMalloc((void**)&d_ah_t, 3*H*sizeof(float));
+
+    cudaMalloc((void**)&d_xr_t, E*sizeof(float));
+    cudaMalloc((void**)&d_axr_t, 3*H*sizeof(float));
+    cudaMalloc((void**)&d_ahr_t, 3*H*sizeof(float));
+
+    cudaMalloc((void**)&d_h_all, 2*H*(Tmax+2)*sizeof(float));
+
+    int *d_word_indices;
+    cudaMalloc((void**)&d_word_indices, B*sizeof(int));
+    int *d_word_indices_r;
+    cudaMalloc((void**)&d_word_indices_r, B*sizeof(int));
+
+    float *d_ctx_mean, *d_init_state;
+    cudaMalloc((void**)&d_ctx_mean, 2*H*sizeof(float));
+    cudaMalloc((void**)&d_init_state, H*sizeof(float));
+
+    float *d_h_all_trans;
+    cudaMalloc((void**)&d_h_all_trans, Tmax*2*H*sizeof(float));
+
+    float *d_pctx_;
+    cudaMalloc((void**)&d_pctx_, Tmax*2*H*sizeof(float));
+
+    int *d_tgt_word_indices;
+    cudaMalloc((void**)&d_tgt_word_indices, K*sizeof(int));
+
+    float *d_s_tm1;
+    cudaMalloc((void**)&d_s_tm1, K*H*sizeof(float));
+
+    float *d_y_tm1, *d_pstate_, *d_pctx__, *d_att, *d_att_sum, *d_ctx, *d_ctx_sum;
+
+    cudaMalloc((void**)&d_y_tm1, K*E*sizeof(float));
+    cudaMalloc((void**)&d_pstate_, K*2*H*sizeof(float));
+    cudaMalloc((void**)&d_pctx__, Tmax*K*2*H*sizeof(float));
+    cudaMalloc((void**)&d_att, Tmax*K*sizeof(float));
+    cudaMalloc((void**)&d_att_sum, K*sizeof(float));
+    cudaMalloc((void**)&d_ctx, Tmax*K*2*H*sizeof(float));
+    cudaMalloc((void**)&d_ctx_sum, K*2*H*sizeof(float));
+
+    // allocate memory for affine_y = y_{t-1} x [U_z,U_r,U_h]
+    // affine_s = s_{t-1} x [W_z,W_r,W_h] on device
+    // affine_c = ctx_ x [Wc_z,Wc_r,Wc_h] on device
+    float *d_ay_t, *d_as_t, *d_ac_t;
+    float *d_s_t;
+    float *d_logit_lstm, *d_logit_prev, *d_logit_ctx;
+    float *d_logit, *d_logit_softmax, *d_logit_softmax_sum;
+
+    cudaMalloc((void**)&d_ay_t, K*3*H*sizeof(float));
+    cudaMalloc((void**)&d_as_t, K*3*H*sizeof(float));
+    cudaMalloc((void**)&d_ac_t, K*3*H*sizeof(float));
+    cudaMalloc((void**)&d_s_t, K*H*sizeof(float));
+    cudaMalloc((void**)&d_logit_lstm, K*E*sizeof(float));
+    cudaMalloc((void**)&d_logit_prev, K*E*sizeof(float));
+    cudaMalloc((void**)&d_logit_ctx, K*E*sizeof(float));
+    cudaMalloc((void**)&d_logit, K*E*sizeof(float));
+    cudaMalloc((void**)&d_logit_softmax, K*V*sizeof(float));
+    cudaMalloc((void**)&d_logit_softmax_sum, K*sizeof(float));
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    float alpha=1.0;  
+    float beta=0.0;  
 
     while(getline(ftest,s))
     {
@@ -255,37 +328,11 @@ int main()
         word_indices.push_back(0);
         int T = word_indices.size();
 
-
-        // allocate memory for x_t, h_{0:T}, affine_x = x_t x [U_z,U_r,U_h], affine_h = h_{t-1} x [W_z,W_r,W_h] on device
-        // forward: d_x_t, d_ax_t, d_ah_t; backward: d_xr_t, d_axr_t, d_ahr_t; both: d_h_all = [h_0,hr_{T+1},h1,hr_T,...,h_{T+1},hr_0]
-        float *d_x_t, *d_ax_t, *d_ah_t;
-        float *d_xr_t, *d_axr_t, *d_ahr_t;
-        float *d_h_all;
-
-        cudaMalloc((void**)&d_x_t, E*sizeof(float));
-        cudaMalloc((void**)&d_ax_t, 3*H*sizeof(float));
-        cudaMalloc((void**)&d_ah_t, 3*H*sizeof(float));
-
-        cudaMalloc((void**)&d_xr_t, E*sizeof(float));
-        cudaMalloc((void**)&d_axr_t, 3*H*sizeof(float));
-        cudaMalloc((void**)&d_ahr_t, 3*H*sizeof(float));
-
-        cudaMalloc((void**)&d_h_all, 2*H*(T+2)*sizeof(float));
-
-        cublasHandle_t handle;
-        cublasCreate(&handle);
-        float alpha=1.0;  
-        float beta=0.0;  
-
         // init h_0, hr_0 with all zeros
         cudaMemset(d_h_all,0,2*H*(T+2)*sizeof(float));
         //show_matrix(d_h_all,2*H,T+2);
 
-        int *d_word_indices;
-        cudaMalloc((void**)&d_word_indices, B*sizeof(int));
-        int *d_word_indices_r;
-        cudaMalloc((void**)&d_word_indices_r, B*sizeof(int));
-
+        B = 1;
         for (int i=0;i<T;i++)
         {
             // fill x_t; B x E => [B x E/n] x n
@@ -318,9 +365,6 @@ int main()
         d_h_all = d_h_all + 2*H;         // skip h0
         //show_matrix(d_h_all,2*H,T);
 
-        float *d_ctx_mean, *d_init_state;
-        cudaMalloc((void**)&d_ctx_mean, 2*H*sizeof(float));
-        cudaMalloc((void**)&d_init_state, H*sizeof(float));
         //cublasSgemv(handle,CUBLAS_OP_N,2*H,T,&alpha,d_h_all,2*H,d_ones,1,&beta,d_ctx_mean,1);
         cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all,2*H,d_ones,T,&beta,d_ctx_mean,2*H);
         float alpha1 = 1.0/T;
@@ -342,63 +386,23 @@ int main()
         vector<float> final_scores;
         
         int dead_k = 0;
-        int K = 10;       // Beamsize
-        B = 1;
 
         vector<vector<int> > hyp_samples(1,vector<int>());
         vector<float> hyp_scores(1,0.0);
 
-        float *d_h_all_trans;
-        cudaMalloc((void**)&d_h_all_trans, T*2*H*sizeof(float));
         // transpose ctx (2H x T) to T x 2H
         cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all, 2*H, &beta, d_h_all, 2*H, d_h_all_trans, T );
         // prod ctx with decoder_Wc_att to get pctx_ (T x 2H)
-        float *d_pctx_;
-        cudaMalloc((void**)&d_pctx_, T*2*H*sizeof(float));
         cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all_trans,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
         //show_matrix(d_pctx_,T,2*H);
         //cout<<"==============\n";
 
-        // allocate memory for target input words at each time step
         vector<int> tgt_word_indices;
         tgt_word_indices.push_back(-1);
-        int *d_tgt_word_indices;
-        cudaMalloc((void**)&d_tgt_word_indices, K*sizeof(int));
 
-        // allocate memory on device for attention calculation
         // prev state on target side
-        float *d_s_tm1;
-        cudaMalloc((void**)&d_s_tm1, K*H*sizeof(float));
         cudaMemcpy(d_s_tm1, d_init_state, H*sizeof(float), cudaMemcpyDeviceToDevice);
 
-        float *d_y_tm1, *d_pstate_, *d_pctx__, *d_att, *d_att_sum, *d_ctx, *d_ctx_sum;
-
-        cudaMalloc((void**)&d_y_tm1, K*E*sizeof(float));
-        cudaMalloc((void**)&d_pstate_, K*2*H*sizeof(float));
-        cudaMalloc((void**)&d_pctx__, T*K*2*H*sizeof(float));
-        cudaMalloc((void**)&d_att, T*K*sizeof(float));
-        cudaMalloc((void**)&d_att_sum, K*sizeof(float));
-        cudaMalloc((void**)&d_ctx, T*K*2*H*sizeof(float));
-        cudaMalloc((void**)&d_ctx_sum, K*2*H*sizeof(float));
-
-        // allocate memory for affine_y = y_{t-1} x [U_z,U_r,U_h]
-        // affine_s = s_{t-1} x [W_z,W_r,W_h] on device
-        // affine_c = ctx_ x [Wc_z,Wc_r,Wc_h] on device
-        float *d_ay_t, *d_as_t, *d_ac_t;
-        float *d_s_t;
-        float *d_logit_lstm, *d_logit_prev, *d_logit_ctx;
-        float *d_logit, *d_logit_softmax, *d_logit_softmax_sum;
-
-        cudaMalloc((void**)&d_ay_t, K*3*H*sizeof(float));
-        cudaMalloc((void**)&d_as_t, K*3*H*sizeof(float));
-        cudaMalloc((void**)&d_ac_t, K*3*H*sizeof(float));
-        cudaMalloc((void**)&d_s_t, K*H*sizeof(float));
-        cudaMalloc((void**)&d_logit_lstm, K*E*sizeof(float));
-        cudaMalloc((void**)&d_logit_prev, K*E*sizeof(float));
-        cudaMalloc((void**)&d_logit_ctx, K*E*sizeof(float));
-        cudaMalloc((void**)&d_logit, K*E*sizeof(float));
-        cudaMalloc((void**)&d_logit_softmax, K*V*sizeof(float));
-        cudaMalloc((void**)&d_logit_softmax_sum, K*sizeof(float));
 
         vector<float> logit_softmax,s_t;
         logit_softmax.resize(K*V);
