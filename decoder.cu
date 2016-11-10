@@ -326,6 +326,11 @@ int main()
         }
         word_indices.push_back(0);
         int T = word_indices.size();
+        /*
+        for (int i=0;i<T;i++)
+            cout<<word_indices[i]<<' ';
+        cout<<endl;
+        */
 
         // init h_0, hr_0 with all zeros
         cudaMemset(d_h_all,0,2*H*(T+2)*sizeof(float));
@@ -339,6 +344,7 @@ int main()
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
             cudaMemcpy(d_word_indices, &word_indices[i], sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
             lookup_kernel<<<grid_shape,block_shape>>>(d_x_t,d_params["Wemb"],d_word_indices,E,B,V);
+
             // backward
             cudaMemcpy(d_word_indices_r, &word_indices[T-1-i], sizeof(int), cudaMemcpyHostToDevice);
             lookup_kernel<<<grid_shape,block_shape>>>(d_xr_t,d_params["Wemb"],d_word_indices_r,E,B,V);
@@ -357,15 +363,20 @@ int main()
             // point wise operation
             dim3 block_shape1(256,1,1);
             dim3 grid_shape1((H + block_shape1.x - 1)/block_shape1.x,1,1);
+            //cout<<"axt   ";
+            //show_matrix(d_ax_t,1,3*H);
+            //cout<<"encoder_b   ";
+            //show_matrix(d_params["encoder_b"],1,3*H);
             elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+2*(i+1)*H,d_ax_t,d_ah_t,d_params["encoder_b"],d_h_tm1,H);
             //backward
             elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+(2*T+1-2*i)*H,d_axr_t,d_ahr_t,d_params["encoder_r_b"],d_hr_Tp1mt,H);
         }
-        d_h_all = d_h_all + 2*H;         // skip h0
-        //show_matrix(d_h_all,2*H,T);
+        //d_h_all = d_h_all + 2*H;         // skip h0, TODO danger!!!
+        //show_matrix(d_h_all+2*H,2*H,T);
+        //cout<<"==========\n";
 
-        //cublasSgemv(handle,CUBLAS_OP_N,2*H,T,&alpha,d_h_all,2*H,d_ones,1,&beta,d_ctx_mean,1);
-        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all,2*H,d_ones,T,&beta,d_ctx_mean,2*H);
+        //cublasSgemv(handle,CUBLAS_OP_N,2*H,T,&alpha,d_h_all+2*H,2*H,d_ones,1,&beta,d_ctx_mean,1);
+        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all+2*H,2*H,d_ones,T,&beta,d_ctx_mean,2*H);
         float alpha1 = 1.0/T;
         cublasSscal(handle, 2*H, &alpha1, d_ctx_mean, 1); 
         //show_matrix(d_ctx_mean,1,2*H);
@@ -377,8 +388,8 @@ int main()
         dim3 grid_shape((H + block_shape.x - 1)/block_shape.x,1,1);
         tanh<<<grid_shape,block_shape>>>(d_init_state,d_params["ff_state_b"],H);
 
-        show_matrix(d_init_state,1,H);
-        cout<<"==============\n";
+        //show_matrix(d_init_state,1,H);
+        //cout<<"==============\n";
 
         /************** decoder part ******************/
         vector<vector<int> > final_samples;
@@ -390,7 +401,7 @@ int main()
         vector<float> hyp_scores(1,0.0);
 
         // transpose ctx (2H x T) to T x 2H
-        cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all, 2*H, &beta, d_h_all, 2*H, d_h_all_trans, T );
+        cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all+2*H, 2*H, &beta, d_h_all+2*H, 2*H, d_h_all_trans, T );
         // prod ctx with decoder_Wc_att to get pctx_ (T x 2H)
         cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all_trans,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
         //show_matrix(d_pctx_,T,2*H);
