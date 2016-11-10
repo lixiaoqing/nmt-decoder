@@ -146,6 +146,7 @@ void show_matrix(float *d_m, int r, int c)
 
 int main()
 {
+    cudaSetDevice(2);
     ifstream flist("param-list");
     if (!flist.is_open())
     {
@@ -232,13 +233,16 @@ int main()
     int H = 1024;
     int B = 1;
     int V = 30000;
-    int K = 4;
+    int K = 10;
     int Tmax = 200;
 
     vector<float> ones(V,1);
     float *d_ones;
     cudaMalloc((void**)&d_ones, V*sizeof(float));
     cudaMemcpy(d_ones, &ones[0], V*sizeof(float), cudaMemcpyHostToDevice);
+
+    int *d_father_idx;
+    cudaMalloc((void**)&d_father_idx, K*sizeof(int));
 
     // allocate memory for x_t, h_{0:T}, affine_x = x_t x [U_z,U_r,U_h], affine_h = h_{t-1} x [W_z,W_r,W_h] on device
     // forward: d_x_t, d_ax_t, d_ah_t; backward: d_xr_t, d_axr_t, d_ahr_t; both: d_h_all = [h_0,hr_{T+1},h1,hr_T,...,h_{T+1},hr_0]
@@ -326,15 +330,13 @@ int main()
         }
         word_indices.push_back(0);
         int T = word_indices.size();
-        /*
-        for (int i=0;i<T;i++)
-            cout<<word_indices[i]<<' ';
-        cout<<endl;
-        */
 
         // init h_0, hr_0 with all zeros
         cudaMemset(d_h_all,0,2*H*(T+2)*sizeof(float));
-        //show_matrix(d_h_all,2*H,T+2);
+
+        /**********************************************/
+        /************** encoder part ******************/
+        /**********************************************/
 
         B = 1;
         for (int i=0;i<T;i++)
@@ -363,24 +365,15 @@ int main()
             // point wise operation
             dim3 block_shape1(256,1,1);
             dim3 grid_shape1((H + block_shape1.x - 1)/block_shape1.x,1,1);
-            //cout<<"axt   ";
-            //show_matrix(d_ax_t,1,3*H);
-            //cout<<"encoder_b   ";
-            //show_matrix(d_params["encoder_b"],1,3*H);
             elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+2*(i+1)*H,d_ax_t,d_ah_t,d_params["encoder_b"],d_h_tm1,H);
             //backward
             elementwise_op<<<grid_shape1,block_shape1>>>(d_h_all+(2*T+1-2*i)*H,d_axr_t,d_ahr_t,d_params["encoder_r_b"],d_hr_Tp1mt,H);
         }
-        //d_h_all = d_h_all + 2*H;         // skip h0, TODO danger!!!
-        //show_matrix(d_h_all+2*H,2*H,T);
-        //cout<<"==========\n";
 
         //cublasSgemv(handle,CUBLAS_OP_N,2*H,T,&alpha,d_h_all+2*H,2*H,d_ones,1,&beta,d_ctx_mean,1);
-        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all+2*H,2*H,d_ones,T,&beta,d_ctx_mean,2*H);
+        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,2*H,1,T,&alpha,d_h_all+2*H,2*H,d_ones,T,&beta,d_ctx_mean,2*H);  // skip h0
         float alpha1 = 1.0/T;
         cublasSscal(handle, 2*H, &alpha1, d_ctx_mean, 1); 
-        //show_matrix(d_ctx_mean,1,2*H);
-        //show_matrix(d_params["ff_state_W"],2*H,H);
 
         cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,H,2*H,&alpha,d_ctx_mean,1,d_params["ff_state_W"],2*H,&beta,d_init_state,1);
 
@@ -388,10 +381,9 @@ int main()
         dim3 grid_shape((H + block_shape.x - 1)/block_shape.x,1,1);
         tanh<<<grid_shape,block_shape>>>(d_init_state,d_params["ff_state_b"],H);
 
-        //show_matrix(d_init_state,1,H);
-        //cout<<"==============\n";
-
+        /**********************************************/
         /************** decoder part ******************/
+        /**********************************************/
         vector<vector<int> > final_samples;
         vector<float> final_scores;
         
@@ -404,8 +396,6 @@ int main()
         cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all+2*H, 2*H, &beta, d_h_all+2*H, 2*H, d_h_all_trans, T );
         // prod ctx with decoder_Wc_att to get pctx_ (T x 2H)
         cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all_trans,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
-        //show_matrix(d_pctx_,T,2*H);
-        //cout<<"==============\n";
 
         vector<int> tgt_word_indices;
         tgt_word_indices.push_back(-1);
@@ -428,34 +418,18 @@ int main()
             // product prev_state with decoder_Wd_att to get pstate_
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,H,&alpha,d_s_tm1,B,d_params["decoder_Wd_att"],H,&beta,d_pstate_,B);
 
-            //show_matrix(d_pstate_,B,2*H);
-            //cout<<"==============\n";
-
             // product prev_emb with decoder_Wi_att and add the result to pstate_
             float beta1 = 1;
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,E,&alpha,d_y_tm1,B,d_params["decoder_Wi_att"],E,&beta1,d_pstate_,B);
-
-            //show_matrix(d_pstate_,B,2*H);
-            //cout<<"==============\n";
 
             // pctx__ = tanh(pctx_[:,None,:] + pstate_[None,:,:] + b_att[None,None,:])
             dim3 block_shape1(128,1,1);
             dim3 grid_shape1(T,B,(2*H + block_shape1.x - 1)/block_shape1.x);
             tanh<<<grid_shape1,block_shape1>>>(d_pctx__,d_pctx_,d_pstate_,d_params["decoder_b_att"],T,B,2*H);
 
-            /*
-            show_matrix(d_pctx__,T*B,2*H);
-            cout<<"==============\n";
-            show_matrix(d_params["decoder_U_att"],1,2*H);
-            cout<<"==============\n";
-            */
-
             // product pctx__ with decoder_U_att (2H x 1) to get alpha (T x B)
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T*B,1,2*H,&alpha,d_pctx__,T*B,d_params["decoder_U_att"],2*H,&beta,d_att,T*B);
             
-            //show_matrix(d_att,T,B);
-            //cout<<"==============\n";
-
             // normalize alpha: alpha = exp(alpha)/exp(alpha).sum(0)
             dim3 block_shape2(256,1,1);
             dim3 grid_shape2((T*B + block_shape2.x - 1)/block_shape2.x,1,1);
@@ -467,37 +441,22 @@ int main()
             dim3 grid_shape3(T,1,1);
             divide<<<grid_shape3,block_shape3>>>(d_att,d_att_sum,T);
 
-            //show_matrix(d_att,T,B);
-            //cout<<"==============\n";
-
             // ctx_ = (ctx[:,None,:] * alpha[:,:,None]).sum(0)
             dim3 block_shape4(128,1,1);
             dim3 grid_shape4(T,B,(2*H + block_shape4.x - 1)/block_shape4.x);
             pointwise_prod<<<grid_shape4,block_shape4>>>(d_ctx,d_h_all_trans,d_att,T,B,2*H);
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,B*2*H,T,&alpha,d_ones,1,d_ctx,T,&beta,d_ctx_sum,1);
 
-            //show_matrix(d_ctx_sum,B,2*H);
-            //cout<<"==============\n";
-
             // get ay_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,E,&alpha,d_y_tm1,B,d_params["decoder_W"],E,&beta,d_ay_t,B);
-            //show_matrix(d_ay_t,B,3*H);
-            //cout<<"==============\n";
             // get as_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,H,&alpha,d_s_tm1,B,d_params["decoder_U"],H,&beta,d_as_t,B);
-            //show_matrix(d_as_t,B,3*H);
-            //cout<<"==============\n";
             // get ac_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,2*H,&alpha,d_ctx_sum,B,d_params["decoder_Wc"],2*H,&beta,d_ac_t,B);
-            //show_matrix(d_ac_t,B,3*H);
-            //cout<<"==============\n";
             // point wise operation
             dim3 block_shape5(256,1,1);
             dim3 grid_shape5(B,(H + block_shape5.x - 1)/block_shape5.x,1);
             elementwise_op_dec<<<grid_shape5,block_shape5>>>(d_s_t,d_ay_t,d_as_t,d_ac_t,d_params["decoder_b"],d_s_tm1,B,H);
-
-            //show_matrix(d_s_t,B,H);
-            //cout<<"==============\n";
 
             // logit = tanh(W x s_t + bs + U x y_tm1 + by + V x ctx + bv)
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,E,H,&alpha,d_s_t,B,d_params["ff_logit_lstm_W"],H,&beta,d_logit_lstm,B);
@@ -505,8 +464,6 @@ int main()
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,E,2*H,&alpha,d_ctx_sum,B,d_params["ff_logit_ctx_W"],2*H,&beta,d_logit_ctx,B);
             tanh<<<grid_shape,block_shape>>>(d_logit,d_logit_lstm,d_logit_prev,d_logit_ctx,
                     d_params["ff_logit_lstm_b"],d_params["ff_logit_prev_b"],d_params["ff_logit_ctx_b"],B,E);
-            //show_matrix(d_logit,B,E);
-            //cout<<"==============\n";
 
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,V,E,&alpha,d_logit,B,d_params["ff_logit_W"],E,&beta,d_logit_softmax,B);
 
@@ -516,11 +473,7 @@ int main()
             // sum
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,1,V,&alpha,d_logit_softmax,B,d_ones,V,&beta,d_logit_softmax_sum,B);
             // divide
-            dim3 block_shape7(256,1,1);
-            dim3 grid_shape7(B,(V + block_shape7.x - 1)/block_shape7.x,1);
-            divide_log<<<grid_shape7,block_shape7>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
-            //show_matrix(d_logit_softmax,B,V);
-            //cout<<"==============\n";
+            divide_log<<<grid_shape6,block_shape6>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
 
             int live_k = K - dead_k;
             cudaMemcpy(&logit_softmax[0], d_logit_softmax, B*V*sizeof(float), cudaMemcpyDeviceToHost);
@@ -545,66 +498,40 @@ int main()
 
             vector<vector<int> > new_hyp_samples;
             vector<float> new_hyp_scores;
-            vector<int> ivec;
+            vector<int> father_idx;
+            tgt_word_indices.clear();
             for (int k = 0; k < live_k; k++) 
             {
                 float score = q.top().first;
                 int i = q.top().second.first;
                 int j = q.top().second.second;
-                //cout<<score<<' '<<i<<' '<<j<<endl;
-                ivec.push_back(i);
-                if (j == 0)
-                    dead_k += 1;
                 vector<int> sample(hyp_samples[i]);
                 sample.push_back(j);
-                new_hyp_samples.push_back(sample);
-                new_hyp_scores.push_back(score);
-                q.pop();
-            }
-            //cout<<"==============="<<endl;
-
-            int old_B = B;
-            cudaMemcpy(&s_t[0], d_s_t, old_B*H*sizeof(float), cudaMemcpyDeviceToHost);
-            B = K-dead_k;
-            hyp_samples.clear();
-            hyp_scores.clear();
-            tgt_word_indices.clear();
-            int kk = 0;
-            vector<float> new_hyp_states;
-            new_hyp_states.resize(B*H);
-            for (int k = 0; k < new_hyp_samples.size(); k++) 
-            {
-                if (new_hyp_samples[k].back() == 0)
+                if (j == 0)
                 {
-                    final_samples.push_back(new_hyp_samples[k]);
-                    final_scores.push_back(new_hyp_scores[k]);
+                    dead_k += 1;
+                    final_samples.push_back(sample);
+                    final_scores.push_back(score);
                 }
                 else
                 {
-                    hyp_samples.push_back(new_hyp_samples[k]);
-                    hyp_scores.push_back(new_hyp_scores[k]);
-                    tgt_word_indices.push_back(new_hyp_samples[k].back());
-                    for (int h=0;h<H;h++)
-                       new_hyp_states[IDX2C(kk,h,B)] = s_t[IDX2C(ivec[k],h,old_B)];
-                    kk += 1;
+                    new_hyp_samples.push_back(sample);
+                    new_hyp_scores.push_back(score);
+                    tgt_word_indices.push_back(j);
+                    father_idx.push_back(i);
                 }
+                q.pop();
             }
-            /*
-            cout<<tgt_word_indices.size()<<endl;
-            for (int i=0;i<tgt_word_indices.size();i++)
-                cout<<tgt_word_indices[i]<<' ';
-            cout<<endl;
-            for (int i=0;i<B;i++)
-            {
-                for (int j=0;j<H;j++)
-                    cout<<new_hyp_states[IDX2C(i,j,B)]<<' ';
-                cout<<endl;
-            }
-            cout<<"==============";
-            */
+            cudaMemcpy(d_father_idx, &father_idx[0], (K-dead_k)*sizeof(int), cudaMemcpyHostToDevice);
+            dim3 block_shape7(256,1,1);
+            dim3 grid_shape7(K-dead_k,(H + block_shape7.x - 1)/block_shape7.x,1);
+            lookup_kernel<<<grid_shape7,block_shape7>>>(d_s_tm1,d_s_t,d_father_idx,H,K-dead_k,B);
+
+            hyp_samples.swap(new_hyp_samples);
+            hyp_scores.swap(new_hyp_scores);
+            B = K-dead_k;
             if (B<=0)
                 break;
-            cudaMemcpy(d_s_tm1, &new_hyp_states[0], B*H*sizeof(float), cudaMemcpyHostToDevice);
         }
         if (K - dead_k > 0)
         {
