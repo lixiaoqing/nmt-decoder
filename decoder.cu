@@ -78,7 +78,7 @@ __global__ void pointwise_prod(float *t3, float *m1, float *m2, int T, int B, in
     int k = threadIdx.x + blockIdx.z*blockDim.x;
     if (k >= HH)
         return;
-    t3[IDX2C(i+j*gridDim.x,k,T*B)] = m1[IDX2C(i,k,T)] * m2[IDX2C(i,j,T)];
+    t3[IDX2C(i+j*gridDim.x,k,T*B)] = m1[IDX2C(k,i,HH)] * m2[IDX2C(i,j,T)];
 }
 
 __global__ void divide(float *v1, float *v2, int T)
@@ -269,9 +269,6 @@ int main()
     cudaMalloc((void**)&d_ctx_mean, 2*H*sizeof(float));
     cudaMalloc((void**)&d_init_state, H*sizeof(float));
 
-    float *d_h_all_trans;
-    cudaMalloc((void**)&d_h_all_trans, Tmax*2*H*sizeof(float));
-
     float *d_pctx_;
     cudaMalloc((void**)&d_pctx_, Tmax*2*H*sizeof(float));
 
@@ -392,10 +389,8 @@ int main()
         vector<vector<int> > hyp_samples(1,vector<int>());
         vector<float> hyp_scores(1,0.0);
 
-        // transpose ctx (2H x T) to T x 2H
-        cublasSgeam( handle, CUBLAS_OP_T, CUBLAS_OP_N, T, 2*H, &alpha, d_h_all+2*H, 2*H, &beta, d_h_all+2*H, 2*H, d_h_all_trans, T );
         // prod ctx with decoder_Wc_att to get pctx_ (T x 2H)
-        cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all_trans,T,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
+        cublasSgemm(handle,CUBLAS_OP_T,CUBLAS_OP_N,T,2*H,2*H,&alpha,d_h_all+2*H,2*H,d_params["decoder_Wc_att"],2*H,&beta,d_pctx_,T);
 
         vector<int> tgt_word_indices;
         tgt_word_indices.push_back(-1);
@@ -444,7 +439,7 @@ int main()
             // ctx_ = (ctx[:,None,:] * alpha[:,:,None]).sum(0)
             dim3 block_shape4(128,1,1);
             dim3 grid_shape4(T,B,(2*H + block_shape4.x - 1)/block_shape4.x);
-            pointwise_prod<<<grid_shape4,block_shape4>>>(d_ctx,d_h_all_trans,d_att,T,B,2*H);
+            pointwise_prod<<<grid_shape4,block_shape4>>>(d_ctx,d_h_all+2*H,d_att,T,B,2*H);
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,1,B*2*H,T,&alpha,d_ones,1,d_ctx,T,&beta,d_ctx_sum,1);
 
             // get ay_t
