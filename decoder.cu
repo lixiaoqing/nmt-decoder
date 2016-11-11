@@ -34,19 +34,6 @@ __global__ void lookup_cols(float *d_lookup, const float *d_Wemb, int *d_word_in
     d_lookup[IDX2C(j,i,E)] = d_Wemb[IDX2C(j,d_word_indices[i],E)];
 }
 
-// get embeddings for words, grid shape: B/n x n, block shape: E/n x n
-__global__ void lookup_kernel(float *d_lookup, const float *d_Wemb, int *d_word_indices, int E, int B, int V)
-{
-    int i = blockIdx.y*gridDim.x + blockIdx.x;
-    int j = threadIdx.y*blockDim.x + threadIdx.x;
-    if (i >= B || j >= E)
-        return;
-    if (d_word_indices[i] < 0)
-        d_lookup[IDX2C(i,j,B)] = 0;
-    else
-        d_lookup[IDX2C(i,j,B)] = d_Wemb[IDX2C(d_word_indices[i],j,V)];
-}
-
 __global__ void tanh(float *v1, float *v2, int len)
 {
    int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -423,8 +410,6 @@ int main()
         for (int i=0;i<T;i++)
         {
             // fill x_t; B x E => [B x E/n] x n
-            //dim3 grid_shape(128,(B+128-1)/128,1);
-            //dim3 block_shape(128,(E+128-1)/128,1);
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
             cudaMemcpy(d_word_indices, &word_indices[i], sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
@@ -491,8 +476,6 @@ int main()
         for (int j=0; j < Tmax; j++)
         {
             // fill y_{t-1}; B x E => [B x E/n] x n
-            //dim3 grid_shape(128,(B+128-1)/128,1);
-            //dim3 block_shape(128,(E+128-1)/128,1);
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
             cudaMemcpy(d_tgt_word_indices, &tgt_word_indices[0], B*sizeof(int), cudaMemcpyHostToDevice);
