@@ -2,6 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <queue>
 #include <string>
 #include <sstream>
@@ -9,12 +10,36 @@
 #define IDX2C(i,j,ld) (((j)*(ld))+(i))
 using namespace std;
 
-// get embeddings for words, grid shape (2-dim): B x E/n, block shape (1-dim): n
-__global__ void lookup_kernel(float *d_lookup, const float *d_Wemb, int *d_word_indices, int E, int B, int V)
+// grid shape: B x E/n, block shape: n
+__global__ void lookup_rows(float *d_lookup, const float *d_Wemb, int *d_word_indices, int E, int B, int V)
 {
+    // i: row idx, j: col idx
     int i = blockIdx.x;
     int j = threadIdx.x + blockIdx.y*blockDim.x;
     if (j >= E)
+        return;
+    if (d_word_indices[i] < 0)
+        d_lookup[IDX2C(i,j,B)] = 0;
+    else
+        d_lookup[IDX2C(i,j,B)] = d_Wemb[IDX2C(d_word_indices[i],j,V)];
+}
+
+__global__ void lookup_cols(float *d_lookup, const float *d_Wemb, int *d_word_indices, int E, int B, int V)
+{
+    // i: col idx, j: row idx
+    int i = blockIdx.x;
+    int j = threadIdx.x + blockIdx.y*blockDim.x;
+    if (j >= E)
+        return;
+    d_lookup[IDX2C(j,i,E)] = d_Wemb[IDX2C(j,d_word_indices[i],E)];
+}
+
+// get embeddings for words, grid shape: B/n x n, block shape: E/n x n
+__global__ void lookup_kernel(float *d_lookup, const float *d_Wemb, int *d_word_indices, int E, int B, int V)
+{
+    int i = blockIdx.y*gridDim.x + blockIdx.x;
+    int j = threadIdx.y*blockDim.x + threadIdx.x;
+    if (i >= B || j >= E)
         return;
     if (d_word_indices[i] < 0)
         d_lookup[IDX2C(i,j,B)] = 0;
@@ -221,6 +246,24 @@ int main()
         ss >> idx >> w;
         tgt_i2w[idx] = w;
     }
+    ifstream fc2e("c2e");
+    if (!fc2e.is_open())
+    {
+        cerr<<"cannot open c2e!\n";
+        return 0;
+    }
+    map<int,vector<int> > c2e;
+    while(getline(fc2e,s))
+    {
+        stringstream ss;
+        ss << s;
+        int c,e;
+        vector<int> es;
+        ss >> c;
+        while (ss >> e)
+            es.push_back(e);
+        c2e[c] = es;
+    }
 
     ifstream ftest("03.seg");
     if (!ftest.is_open())
@@ -235,6 +278,17 @@ int main()
     int V = 30000;
     int K = 10;
     int Tmax = 200;
+    int VV = 30000;
+
+    float *d_Wemb_dec,*d_ff_logit_W,*d_ff_logit_b;
+    int *d_tgt_vocab;
+    cudaMalloc((void**)&d_Wemb_dec, V*E*sizeof(float));
+    cudaMalloc((void**)&d_ff_logit_W, V*E*sizeof(float));
+    cudaMalloc((void**)&d_ff_logit_b, V*sizeof(float));
+    cudaMalloc((void**)&d_tgt_vocab, V*sizeof(int));
+    d_params["m_Wemb_dec"] = d_Wemb_dec;
+    d_params["m_ff_logit_W"] = d_ff_logit_W;
+    d_params["m_ff_logit_b"] = d_ff_logit_b;
 
     vector<float> ones(V,1);
     float *d_ones;
@@ -318,13 +372,43 @@ int main()
         ss << s;
         string w;
         vector<int> word_indices;
+        set<int> se;
+        se.insert(0);
+        se.insert(1);
         while (ss>>w)
         {
+            int cid;
             if (src_w2i.find(w) != src_w2i.end() && src_w2i[w] < 30000)
-                word_indices.push_back(src_w2i[w]);
+            {
+                cid = src_w2i[w];
+                word_indices.push_back(cid);
+                for (int i=0;i<c2e[cid].size();i++)
+                {
+                    se.insert(c2e[cid][i]);
+                }
+            }
             else
+            {
                 word_indices.push_back(1);
+            }
         }
+        vector<int> tgt_vocab;
+        for (set<int>::iterator it=se.begin();it!=se.end();it++)
+        {
+            tgt_vocab.push_back(*it);
+        }
+        VV = tgt_vocab.size();
+        //dim3 block_shape0((E + 128 - 1)/128,128,1);
+        //dim3 grid_shape0((VV + 128 - 1)/128,128,1);
+        dim3 block_shape0(128,1,1);
+        dim3 grid_shape0(VV,(E + block_shape0.x - 1)/block_shape0.x,1);
+        cudaMemcpy(d_tgt_vocab, &tgt_vocab[0], VV*sizeof(int), cudaMemcpyHostToDevice);
+        lookup_rows<<<grid_shape0,block_shape0>>>(d_params["m_Wemb_dec"],d_params["Wemb_dec"],d_tgt_vocab,E,VV,V);
+        lookup_cols<<<grid_shape0,block_shape0>>>(d_params["m_ff_logit_W"],d_params["ff_logit_W"],d_tgt_vocab,E,VV,V);
+        dim3 block_shape1(1,1,1);
+        dim3 grid_shape1(VV,1,1);
+        lookup_rows<<<grid_shape1,block_shape1>>>(d_params["m_ff_logit_b"],d_params["ff_logit_b"],d_tgt_vocab,1,VV,V);
+
         word_indices.push_back(0);
         int T = word_indices.size();
 
@@ -339,14 +423,16 @@ int main()
         for (int i=0;i<T;i++)
         {
             // fill x_t; B x E => [B x E/n] x n
+            //dim3 grid_shape(128,(B+128-1)/128,1);
+            //dim3 block_shape(128,(E+128-1)/128,1);
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
             cudaMemcpy(d_word_indices, &word_indices[i], sizeof(int), cudaMemcpyHostToDevice);  // TODO could be done outside
-            lookup_kernel<<<grid_shape,block_shape>>>(d_x_t,d_params["Wemb"],d_word_indices,E,B,V);
+            lookup_rows<<<grid_shape,block_shape>>>(d_x_t,d_params["Wemb"],d_word_indices,E,B,V);
 
             // backward
             cudaMemcpy(d_word_indices_r, &word_indices[T-1-i], sizeof(int), cudaMemcpyHostToDevice);
-            lookup_kernel<<<grid_shape,block_shape>>>(d_xr_t,d_params["Wemb"],d_word_indices_r,E,B,V);
+            lookup_rows<<<grid_shape,block_shape>>>(d_xr_t,d_params["Wemb"],d_word_indices_r,E,B,V);
             // get ax_t
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,3*H,E,&alpha,d_x_t,B,d_params["encoder_W"],E,&beta,d_ax_t,B);
             // backward
@@ -405,10 +491,12 @@ int main()
         for (int j=0; j < Tmax; j++)
         {
             // fill y_{t-1}; B x E => [B x E/n] x n
+            //dim3 grid_shape(128,(B+128-1)/128,1);
+            //dim3 block_shape(128,(E+128-1)/128,1);
             dim3 block_shape(128,1,1);
             dim3 grid_shape(B,(E + block_shape.x - 1)/block_shape.x,1);
             cudaMemcpy(d_tgt_word_indices, &tgt_word_indices[0], B*sizeof(int), cudaMemcpyHostToDevice);
-            lookup_kernel<<<grid_shape,block_shape>>>(d_y_tm1,d_params["Wemb_dec"],d_tgt_word_indices,E,B,V);
+            lookup_rows<<<grid_shape,block_shape>>>(d_y_tm1,d_params["m_Wemb_dec"],d_tgt_word_indices,E,B,VV);
 
             // product prev_state with decoder_Wd_att to get pstate_
             cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,2*H,H,&alpha,d_s_tm1,B,d_params["decoder_Wd_att"],H,&beta,d_pstate_,B);
@@ -460,22 +548,22 @@ int main()
             tanh<<<grid_shape,block_shape>>>(d_logit,d_logit_lstm,d_logit_prev,d_logit_ctx,
                     d_params["ff_logit_lstm_b"],d_params["ff_logit_prev_b"],d_params["ff_logit_ctx_b"],B,E);
 
-            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,V,E,&alpha,d_logit,B,d_params["ff_logit_W"],E,&beta,d_logit_softmax,B);
+            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,VV,E,&alpha,d_logit,B,d_params["m_ff_logit_W"],E,&beta,d_logit_softmax,B);
 
             dim3 block_shape6(256,1,1);
-            dim3 grid_shape6(B,(V + block_shape6.x - 1)/block_shape6.x,1);
-            exp_v<<<grid_shape6,block_shape6>>>(d_logit_softmax, d_params["ff_logit_b"], B, V);
+            dim3 grid_shape6(B,(VV + block_shape6.x - 1)/block_shape6.x,1);
+            exp_v<<<grid_shape6,block_shape6>>>(d_logit_softmax, d_params["m_ff_logit_b"], B, VV);
             // sum
-            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,1,V,&alpha,d_logit_softmax,B,d_ones,V,&beta,d_logit_softmax_sum,B);
+            cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,B,1,VV,&alpha,d_logit_softmax,B,d_ones,VV,&beta,d_logit_softmax_sum,B);
             // divide
-            divide_log<<<grid_shape6,block_shape6>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
+            divide_log<<<grid_shape6,block_shape6>>>(d_logit_softmax,d_logit_softmax_sum,B,VV);
 
             int live_k = K - dead_k;
-            cudaMemcpy(&logit_softmax[0], d_logit_softmax, B*V*sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&logit_softmax[0], d_logit_softmax, B*VV*sizeof(float), cudaMemcpyDeviceToHost);
             priority_queue<pair<float,pair<int,int> >,vector<pair<float,pair<int,int> > >,greater<pair<float,pair<int,int> > > > q;
             for (int i=0;i<B;i++)
             {
-                for (int j=0;j<V;j++)
+                for (int j=0;j<VV;j++)
                 {
                     float score = logit_softmax[IDX2C(i,j,B)] + hyp_scores[i];
                     if (q.size() < live_k )
@@ -518,9 +606,11 @@ int main()
                 q.pop();
             }
             cudaMemcpy(d_father_idx, &father_idx[0], (K-dead_k)*sizeof(int), cudaMemcpyHostToDevice);
+            //dim3 grid_shape7(128,(K-dead_k+128-1)/128,1);
+            //dim3 block_shape7(128,(H+128-1)/128,1);
             dim3 block_shape7(256,1,1);
             dim3 grid_shape7(K-dead_k,(H + block_shape7.x - 1)/block_shape7.x,1);
-            lookup_kernel<<<grid_shape7,block_shape7>>>(d_s_tm1,d_s_t,d_father_idx,H,K-dead_k,B);
+            lookup_rows<<<grid_shape7,block_shape7>>>(d_s_tm1,d_s_t,d_father_idx,H,K-dead_k,B);
 
             hyp_samples.swap(new_hyp_samples);
             hyp_scores.swap(new_hyp_scores);
@@ -549,7 +639,9 @@ int main()
         }
         for (int i=0;i<final_samples[best_k].size() - 1;i++)
         {
-            cout<<tgt_i2w[final_samples[best_k][i]]<<' ';
+            //cout<<final_samples[best_k][i]<<' ';
+            cout<<tgt_i2w[tgt_vocab[final_samples[best_k][i]]]<<' ';
+            //cout<<tgt_i2w[final_samples[best_k][i]]<<' ';
         }
         cout<<endl;
     }
