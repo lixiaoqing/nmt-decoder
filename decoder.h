@@ -25,9 +25,9 @@ class Decoder
         vector<int> decode();
         void init_decoder_state();
         void get_next_prob(vector<int> tgt_wids);
-        void generate_new_samples(vector<vector<int> > &hyp_samples,vector<float> &hyp_scores,
-                vector<vector<int> > &final_samples, vector<float> &final_scores,
-                vector<float> &logit_softmax,int &dead_k,vector<int> &tgt_wids);
+        void generate_new_samples(vector<vector<int> > &hyp_samples,vector<float> &hyp_scores,vector<vector<vector<float> > > &hyp_att,
+                vector<vector<int> > &final_samples, vector<float> &final_scores, vector<vector<vector<float> > > &final_att,
+                int &dead_k,vector<int> &tgt_wids);
 
         map<string,float*> d_params;
         map<string,int> src_w2i;

@@ -435,12 +435,20 @@ void Decoder::get_next_prob(vector<int> tgt_wids)
     divide_log<<<grid_shape6,block_shape6>>>(d_logit_softmax,d_logit_softmax_sum,B,V);
 }
 
-void Decoder::generate_new_samples(vector<vector<int> > &hyp_samples,vector<float> &hyp_scores,
-        vector<vector<int> > &final_samples, vector<float> &final_scores,
-        vector<float> &logit_softmax,int &dead_k,vector<int> &tgt_wids)
+void Decoder::generate_new_samples(vector<vector<int> > &hyp_samples,vector<float> &hyp_scores,vector<vector<vector<float> > > &hyp_att,
+        vector<vector<int> > &final_samples, vector<float> &final_scores, vector<vector<vector<float> > > &final_att,
+        int &dead_k,vector<int> &tgt_wids)
 {
+    // prob distribution at next step
+    vector<float> logit_softmax;
+    logit_softmax.resize(B*V);
+    // att distribution at next step
+    vector<float> next_att;
+    next_att.resize(T*B);
+
     int live_k = K - dead_k;
     cudaMemcpy(&logit_softmax[0], d_logit_softmax, B*V*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&next_att[0], d_att, T*B*sizeof(float), cudaMemcpyDeviceToHost);
     priority_queue<pair<float,pair<int,int> >,vector<pair<float,pair<int,int> > >,greater<pair<float,pair<int,int> > > > q;
     for (int i=0;i<B;i++)
     {
@@ -462,6 +470,7 @@ void Decoder::generate_new_samples(vector<vector<int> > &hyp_samples,vector<floa
 
     vector<vector<int> > new_hyp_samples;
     vector<float> new_hyp_scores;
+    vector<vector<vector<float> > > new_hyp_att;
     vector<int> father_idx;
     tgt_wids.clear();
     for (int k = 0; k < live_k; k++) 
@@ -471,16 +480,25 @@ void Decoder::generate_new_samples(vector<vector<int> > &hyp_samples,vector<floa
         int j = q.top().second.second;
         vector<int> sample(hyp_samples[i]);
         sample.push_back(j);
+        vector<vector<float> > att(hyp_att[i]);
+        vector<float> a;
+        for (int l = 0; l < T; l++)
+        {
+            a.push_back(next_att[IDX2C(l,i,T)]);
+        }
+        att.push_back(a);
         if (j == 0)
         {
             dead_k += 1;
             final_samples.push_back(sample);
             final_scores.push_back(score);
+            final_att.push_back(att);
         }
         else
         {
             new_hyp_samples.push_back(sample);
             new_hyp_scores.push_back(score);
+            new_hyp_att.push_back(att);
             tgt_wids.push_back(j);
             father_idx.push_back(i);
         }
@@ -493,6 +511,7 @@ void Decoder::generate_new_samples(vector<vector<int> > &hyp_samples,vector<floa
 
     hyp_samples.swap(new_hyp_samples);
     hyp_scores.swap(new_hyp_scores);
+    hyp_att.swap(new_hyp_att);
 }
 
 vector<int> Decoder::decode()
@@ -501,8 +520,10 @@ vector<int> Decoder::decode()
     // decode
     vector<vector<int> > final_samples;
     vector<float> final_scores;
+    vector<vector<vector<float> > > final_att(1,vector<vector<float> >());
     vector<vector<int> > hyp_samples(1,vector<int>());
     vector<float> hyp_scores(1,0.0);
+    vector<vector<vector<float> > > hyp_att(1,vector<vector<float> >());
     int dead_k = 0;
 
     // transpose ctx (2H x T) to T x 2H
@@ -513,17 +534,13 @@ vector<int> Decoder::decode()
     // initial state on target side
     cudaMemcpy(d_s_tm1, d_init_state, H*sizeof(float), cudaMemcpyDeviceToDevice);
 
-    // prob distribution at next step
-    vector<float> logit_softmax;
-    logit_softmax.resize(K*V);
-
     // word indices at each step
     vector<int> tgt_wids;
     tgt_wids.push_back(-1);
     for (int j=0; j < Tmax; j++)
     {
         get_next_prob(tgt_wids);
-        generate_new_samples(hyp_samples,hyp_scores,final_samples,final_scores,logit_softmax,dead_k,tgt_wids);
+        generate_new_samples(hyp_samples,hyp_scores,hyp_att,final_samples,final_scores,final_att,dead_k,tgt_wids);
         B = K-dead_k;
         if (B<=0)
             break;
@@ -534,6 +551,7 @@ vector<int> Decoder::decode()
         {
             final_samples.push_back(hyp_samples[k]);
             final_scores.push_back(hyp_scores[k]);
+            final_att.push_back(hyp_att[k]);
         }
     }
     float best_score = -9999;
@@ -546,6 +564,12 @@ vector<int> Decoder::decode()
             best_score = score;
             best_k = k;
         }
+    }
+    for (int i=0;i<final_samples[best_k].size();i++)
+    {
+        for (int j=0;j<T;j++)
+            cout<<final_att[best_k][i][j]<<' ';
+        cout<<endl;
     }
     return final_samples[best_k];
 }
@@ -576,5 +600,6 @@ int main(int argc, char* argv[])
     while(getline(ftest,s))
     {
         cout<<d.translate(s)<<endl;
+        cin.get();
     }
 }
